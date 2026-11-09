@@ -1,8 +1,28 @@
 #include "models.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include "llama-memory-recurrent.h"
 #include "llama-memory-hybrid-idx.h"
+
+// LLAMA_DSA_CHUNK=N: the DSA layers process a large ubatch N queries at a time (0 or unset = off)
+static int64_t kimi_k31_dsa_chunk() {
+    static const int64_t n = [] {
+        const char * e = std::getenv("LLAMA_DSA_CHUNK");
+        return e ? std::max<int64_t>(0, std::atoll(e)) : 0;
+    }();
+    return n;
+}
+
+// rows [t0, t0 + n) of dim 1
+static ggml_tensor * kimi_k31_view_dim1(ggml_context * ctx, ggml_tensor * t, int64_t t0, int64_t n) {
+    return ggml_view_4d(ctx, t, t->ne[0], n, t->ne[2], t->ne[3], t->nb[1], t->nb[2], t->nb[3], t0*t->nb[1]);
+}
+
+// rows [t0, t0 + n) of dim 2
+static ggml_tensor * kimi_k31_view_dim2(ggml_context * ctx, ggml_tensor * t, int64_t t0, int64_t n) {
+    return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n, t->ne[3], t->nb[1], t->nb[2], t->nb[3], t0*t->nb[2]);
+}
 
 //
 // Kimi-K3.1 text model: Kimi-K3 with DSA (indexer + top-k) on the full-attention layers.
@@ -282,6 +302,19 @@ llama_model_kimi_k31::graph::graph(const llm_graph_params & params) :
                 "the indexer cache must track the attention cache cell for cell");
     }
 
+    // the KQ mask is a host input and the scheduler copies each view of it to the device separately,
+    // so the chunk views are made once here and shared by all DSA layers
+    {
+        ggml_tensor * kq_mask = inp_attn->self_attn_mask.raw;
+        const int64_t n_chunk = kimi_k31_dsa_chunk();
+        if (kq_mask && n_chunk > 0 && kq_mask->ne[3] == 1 && kq_mask->ne[1] > n_chunk) {
+            for (int64_t t0 = 0; t0 < kq_mask->ne[1]; t0 += n_chunk) {
+                const int64_t n = std::min(n_chunk, kq_mask->ne[1] - t0);
+                dsa_chunks.push_back({ t0, n, kimi_k31_view_dim1(ctx0, kq_mask, t0, n) });
+            }
+        }
+    }
+
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     const int64_t n_head_kda = hparams.n_head();
@@ -305,7 +338,7 @@ llama_model_kimi_k31::graph::graph(const llm_graph_params & params) :
     const bool     use_attn_res  = res_bs > 0;
     const int64_t  n_embd_latent = hparams.n_expert_latent > 0 ? hparams.n_expert_latent : n_embd;
 
-    ggml_tensor * prev_sel = nullptr;
+    dsa_out prev_dsa = { nullptr, nullptr, {} };
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -331,11 +364,10 @@ llama_model_kimi_k31::graph::graph(const llm_graph_params & params) :
             cur = build_kda_layer(cur, layer, inp_rs, d_conv, head_dim, n_head_kda,
                                   d_inner, n_seq_tokens, n_seqs, il);
         } else {
-            dsa_out dsa = build_dsa_layer(cur, layer, mctx_idx, inp_attn, prev_sel,
-                                          n_embd_head_k_mla, kv_lora_rank,
-                                          n_embd_head_qk_rope, n_embd_head_qk_nope, kq_scale_mla, il);
-            cur      = dsa.out;
-            prev_sel = dsa.sel;
+            prev_dsa = build_dsa_layer(cur, layer, mctx_idx, inp_attn, prev_dsa,
+                                       n_embd_head_k_mla, kv_lora_rank,
+                                       n_embd_head_qk_rope, n_embd_head_qk_nope, kq_scale_mla, il);
+            cur = prev_dsa.out;
         }
 
         prefix_sum = banked ? cur : ggml_add(ctx0, prefix_sum, cur);
@@ -502,7 +534,7 @@ llama_model_kimi_k31::graph::dsa_out
 llama_model_kimi_k31::graph::build_dsa_layer(
         ggml_tensor * cur, const llama_layer & layer,
         const llama_kv_cache_context * mctx_idx, llm_graph_input_attn_k * inp_attn,
-        ggml_tensor * prev_sel,
+        const dsa_out & prev,
         int64_t n_embd_head_k_mla, int64_t kv_lora_rank,
         int64_t n_embd_head_qk_rope, int64_t n_embd_head_qk_nope, float kq_scale, int il) {
 
@@ -552,7 +584,12 @@ llama_model_kimi_k31::graph::build_dsa_layer(
     ggml_tensor * K = ggml_concat(ctx0, kv_cmpr_3d, k_pe, 0);
 
     // --- DSA: keep only the top-k cells of this layer ---
-    ggml_tensor * sel = prev_sel;
+    ggml_tensor * kq_mask = inp_attn->self_attn_mask.raw;
+
+    const auto & chunks = dsa_chunks;
+
+    ggml_tensor *              sel   = prev.sel;   // unchunked
+    std::vector<ggml_tensor *> top_k = prev.top_k; // one per query chunk
     if (hparams.is_indexer_full(il) && layer.indexer_attn_q_b) {
         GGML_ASSERT(mctx_idx != nullptr);
 
@@ -580,39 +617,59 @@ llama_model_kimi_k31::graph::build_dsa_layer(
         iw = ggml_view_4d(ctx0, iw, n_idx_head, n_tokens/n_stream, 1, n_stream,
                 iw->nb[1], iw->nb[2]/n_stream, iw->nb[2]/n_stream, 0);
 
-        ggml_tensor * kq_mask_lid = inp_attn->self_attn_mask.raw;
-        if (cparams.fused_lid && kq_mask_lid->type != GGML_TYPE_F16) {
-            kq_mask_lid = ggml_cast(ctx0, kq_mask_lid, GGML_TYPE_F16);
-        }
+        // score + top-k of the queries [t0, t0 + n), m = their rows of the KQ mask
+        auto build_top_k = [&](int64_t t0, int64_t n, ggml_tensor * m) -> ggml_tensor * {
+            ggml_tensor * iq_c = iq;
+            ggml_tensor * iw_c = iw;
+            if (n != kq_mask->ne[1]) {
+                iq_c = kimi_k31_view_dim2(ctx0, iq, t0, n);
+                iw_c = kimi_k31_view_dim1(ctx0, iw, t0, n);
+            }
+            if (cparams.fused_lid && m->type != GGML_TYPE_F16) {
+                m = ggml_cast(ctx0, m, GGML_TYPE_F16);
+            }
 
-        ggml_tensor * score;
-        if (cparams.fused_lid) {
-            score = ggml_lightning_indexer(ctx0, iq, ik, iw, kq_mask_lid);
-            res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+            ggml_tensor * score;
+            if (cparams.fused_lid) {
+                score = ggml_lightning_indexer(ctx0, iq_c, ik, iw_c, m);
+                res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+            } else {
+                ggml_tensor * q_p = ggml_permute(ctx0, iq_c, 0, 2, 1, 3); // [n_idx_dim, n_tokens, n_idx_head]
+                ggml_tensor * k_p = ggml_permute(ctx0, ik,   0, 2, 1, 3); // [n_idx_dim, n_kv, 1]
+
+                ggml_tensor * kq = ggml_mul_mat(ctx0, k_p, q_p);        // [n_kv, n_tokens, n_idx_head]
+                kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3)); // [n_idx_head, n_tokens, n_kv]
+
+                score = ggml_relu(ctx0, kq);
+                score = ggml_mul(ctx0, score, iw_c);
+                score = ggml_sum_rows(ctx0, score);                      // [1, n_tokens, n_kv]
+                score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3)); // [n_kv, n_tokens, 1]
+
+                score = ggml_add(ctx0, score, m);
+            }
+            cb(score, "indexer_score", il);
+
+            const int64_t n_top_k = std::min<int64_t>(score->ne[0], hparams.indexer_top_k);
+            ggml_tensor * tk = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
+            cb(tk, "indexer_top_k", il);
+
+            return tk;
+        };
+
+        if (chunks.empty()) {
+            sel = build_top_k_mask(kq_mask, build_top_k(0, kq_mask->ne[1], kq_mask), il);
+            cb(sel, "kq_mask_dsa", il);
         } else {
-            ggml_tensor * q_p = ggml_permute(ctx0, iq, 0, 2, 1, 3); // [n_idx_dim, n_tokens, n_idx_head]
-            ggml_tensor * k_p = ggml_permute(ctx0, ik, 0, 2, 1, 3); // [n_idx_dim, n_kv, 1]
-
-            ggml_tensor * kq = ggml_mul_mat(ctx0, k_p, q_p);        // [n_kv, n_tokens, n_idx_head]
-            kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3)); // [n_idx_head, n_tokens, n_kv]
-
-            score = ggml_relu(ctx0, kq);
-            score = ggml_mul(ctx0, score, iw);
-            score = ggml_sum_rows(ctx0, score);                      // [1, n_tokens, n_kv]
-            score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3)); // [n_kv, n_tokens, 1]
-
-            score = ggml_add(ctx0, score, kq_mask_lid);
+            // each score is freed by its top-k before the next score is built, so the chunks reuse one buffer
+            top_k.clear();
+            for (const auto & c : chunks) {
+                top_k.push_back(build_top_k(c.t0, c.n, c.mask));
+                ggml_build_forward_expand(gf, top_k.back());
+            }
         }
-        cb(score, "indexer_score", il);
-
-        const int64_t n_top_k = std::min<int64_t>(score->ne[0], hparams.indexer_top_k);
-        ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
-        cb(top_k, "indexer_top_k", il);
-
-        sel = build_top_k_mask(inp_attn->self_attn_mask.raw, top_k, il);
-        cb(sel, "kq_mask_dsa", il);
     } else {
-        GGML_ASSERT(sel != nullptr && "shared indexer layer must follow a full indexer layer");
+        GGML_ASSERT((chunks.empty() ? sel != nullptr : top_k.size() == chunks.size()) &&
+                "shared indexer layer must follow a full indexer layer");
     }
 
     ggml_build_forward_expand(gf, Q);
@@ -628,8 +685,27 @@ llama_model_kimi_k31::graph::build_dsa_layer(
     // the cache holds at least 4096 cells. on the dense fallbacks the mask keeps the result correct
     // but the kq and kqv products still run over the whole cache, and the indexer is pure overhead
     const int64_t n_sel = std::min<int64_t>(mctx_mla->get_n_kv(), hparams.indexer_top_k);
-    ggml_tensor * out = build_attn_mha(Q, k, v, nullptr, sel, nullptr, nullptr, layer.wv_b,
-                                       n_sel, kq_scale, il);
+    ggml_tensor * out = nullptr;
+    if (chunks.empty()) {
+        out = build_attn_mha(Q, k, v, nullptr, sel, nullptr, nullptr, layer.wv_b,
+                             n_sel, kq_scale, il);
+    } else {
+        // the top-k mask of a chunk is freed after its flash attention, before the next chunk's is built
+        for (size_t ic = 0; ic < chunks.size(); ++ic) {
+            const int64_t t0 = chunks[ic].t0;
+            const int64_t n  = chunks[ic].n;
+
+            ggml_tensor * sel_c = build_top_k_mask(chunks[ic].mask, top_k[ic], il);
+            cb(sel_c, "kq_mask_dsa", il);
+
+            ggml_tensor * Q_c   = ggml_view_3d(ctx0, Q, Q->ne[0], Q->ne[1], n, Q->nb[1], Q->nb[2], t0*Q->nb[2]);
+            ggml_tensor * out_c = build_attn_mha(Q_c, k, v, nullptr, sel_c, nullptr, nullptr, layer.wv_b,
+                                                 n_sel, kq_scale, il);
+            ggml_build_forward_expand(gf, out_c);
+
+            out = out ? ggml_concat(ctx0, out, out_c, 1) : out_c;
+        }
+    }
     cb(out, "kqv_out", il);
 
     // K3.1: attn_output *= sigmoid(g_proj(x)), then o_proj
@@ -642,7 +718,7 @@ llama_model_kimi_k31::graph::build_dsa_layer(
     out = ggml_mul_mat(ctx0, layer.wo, out);
     cb(out, "mla_out", il);
 
-    return { out, sel };
+    return { out, sel, top_k };
 }
 
 //

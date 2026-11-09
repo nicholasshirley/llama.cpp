@@ -2988,15 +2988,25 @@ struct llama_model_kimi_k31 : public llama_model_base {
                                       int64_t d_conv, int64_t head_dim, int64_t n_head_kda,
                                       int64_t d_inner, int64_t n_seq_tokens, int64_t n_seqs, int il);
 
+        // LLAMA_DSA_CHUNK: queries [t0, t0 + n) of the ubatch and their rows of the KQ mask
+        struct dsa_chunk {
+            int64_t       t0;
+            int64_t       n;
+            ggml_tensor * mask;
+        };
+        std::vector<dsa_chunk> dsa_chunks;
+
+        // a shared indexer layer reuses the selection: the top-k mask, or the top-k of each chunk
         struct dsa_out {
-            ggml_tensor * out;
-            ggml_tensor * sel;
+            ggml_tensor *              out;
+            ggml_tensor *              sel;
+            std::vector<ggml_tensor *> top_k;
         };
 
         dsa_out build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
                                 const llama_kv_cache_context * mctx_idx,
                                 llm_graph_input_attn_k * inp_attn,
-                                ggml_tensor * prev_sel,
+                                const dsa_out & prev,
                                 int64_t n_embd_head_k_mla, int64_t kv_lora_rank,
                                 int64_t n_embd_head_qk_rope,
                                 int64_t n_embd_head_qk_nope, float kq_scale, int il);
